@@ -19,6 +19,8 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/process/monitor"
 	"github.com/DataDog/datadog-agent/pkg/util/kernel"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
+	ddsync "github.com/DataDog/datadog-agent/pkg/util/sync"
+
 	manager "github.com/DataDog/ebpf-manager"
 )
 
@@ -82,12 +84,7 @@ var envoyCmd = []byte("/bin/envoy")
 // readBufferPool is used for reading /proc/<pid>/cmdline files.
 // We use a pointer to a slice to avoid allocations when casting
 // values to the empty interface during Put() calls.
-var readBufferPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 128)
-		return &b
-	},
-}
+var readBufferPool = ddsync.NewSlicePool[byte](128, 128)
 
 // istioMonitor essentially scans for Envoy processes and attaches SSL uprobes
 // to them.
@@ -108,6 +105,9 @@ type istioMonitor struct {
 	done chan struct{}
 }
 
+// Validate that istioMonitor implements the Attacher interface.
+var _ utils.Attacher = &istioMonitor{}
+
 func newIstioMonitor(c *config.Config, mgr *manager.Manager) *istioMonitor {
 	if !c.EnableIstioMonitoring {
 		return nil
@@ -125,6 +125,32 @@ func newIstioMonitor(c *config.Config, mgr *manager.Manager) *istioMonitor {
 	}
 }
 
+// DetachPID detaches a given pid from the eBPF program
+func (m *istioMonitor) DetachPID(pid uint32) error {
+	return m.registry.Unregister(pid)
+}
+
+var (
+	// ErrNoEnvoyPath is returned when no envoy path is found for a given PID
+	ErrNoEnvoyPath = fmt.Errorf("no envoy path found for PID")
+)
+
+// AttachPID attaches a given pid to the eBPF program
+func (m *istioMonitor) AttachPID(pid uint32) error {
+	path := m.getEnvoyPath(pid)
+	if path == "" {
+		return ErrNoEnvoyPath
+	}
+
+	return m.registry.Register(
+		path,
+		pid,
+		m.registerCB,
+		m.unregisterCB,
+	)
+}
+
+// Start the istioMonitor
 func (m *istioMonitor) Start() {
 	if m == nil {
 		return
@@ -171,9 +197,11 @@ func (m *istioMonitor) Start() {
 		}
 	}()
 
-	log.Debug("Istio monitoring enabled")
+	utils.AddAttacher("istio", m)
+	log.Info("Istio monitoring enabled")
 }
 
+// Stop the istioMonitor.
 func (m *istioMonitor) Stop() {
 	if m == nil {
 		return
@@ -199,36 +227,26 @@ func (m *istioMonitor) sync() {
 		}
 
 		// This is a new PID so we attempt to attach SSL probes to it
-		m.handleProcessExec(uint32(pid))
+		_ = m.AttachPID(uint32(pid))
 		return nil
 	})
 
 	// At this point all entries from deletionCandidates are no longer alive, so
-	// we should dettach our SSL probes from them
+	// we should detach our SSL probes from them
 	for pid := range deletionCandidates {
 		m.handleProcessExit(pid)
 	}
-}
-
-func (m *istioMonitor) handleProcessExec(pid uint32) {
-	path := m.getEnvoyPath(pid)
-	if path == "" {
-		return
-	}
-
-	m.registry.Register(
-		path,
-		pid,
-		m.registerCB,
-		m.unregisterCB,
-	)
 }
 
 func (m *istioMonitor) handleProcessExit(pid uint32) {
 	// We avoid filtering PIDs here because it's cheaper to simply do a registry lookup
 	// instead of fetching a process name in order to determine whether it is an
 	// envoy process or not (which at the very minimum involves syscalls)
-	m.registry.Unregister(pid)
+	_ = m.DetachPID(pid)
+}
+
+func (m *istioMonitor) handleProcessExec(pid uint32) {
+	_ = m.AttachPID(pid)
 }
 
 // getEnvoyPath returns the executable path of the envoy binary for a given PID.
@@ -255,7 +273,7 @@ func (m *istioMonitor) getEnvoyPath(pid uint32) string {
 
 	// From here on we shouldn't allocate for the common case
 	// (eg., a process is *not* envoy)
-	bufferPtr := readBufferPool.Get().(*[]byte)
+	bufferPtr := readBufferPool.Get()
 	defer func() {
 		readBufferPool.Put(bufferPtr)
 	}()

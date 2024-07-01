@@ -13,7 +13,11 @@ third_party_licenses "../LICENSE-3rdparty.csv"
 
 homepage 'http://www.datadoghq.com'
 
-INSTALL_DIR = ENV['INSTALL_DIR'] || '/opt/datadog-installer'
+if windows_target?
+  INSTALL_DIR = 'C:/opt/datadog-installer/'
+else
+  INSTALL_DIR = ENV['INSTALL_DIR'] || '/opt/datadog-installer'
+end
 
 install_dir INSTALL_DIR
 
@@ -28,7 +32,9 @@ else
   COMPRESSION_LEVEL = 5
 end
 
-if redhat_target? || suse_target?
+if windows_target?
+  maintainer 'Datadog Inc.'
+elsif redhat_target? || suse_target?
   maintainer 'Datadog, Inc <package@datadoghq.com>'
 
   # NOTE: with script dependencies, we only care about preinst/postinst/posttrans,
@@ -70,7 +76,7 @@ description 'Datadog Installer
  See http://www.datadoghq.com/ for more information
 '
 
-if ENV["OMNIBUS_PACKAGE_ARTIFACT"]
+if ENV["OMNIBUS_PACKAGE_ARTIFACT_DIR"]
   dependency "package-artifact"
   generate_distro_package = true
 else
@@ -127,6 +133,10 @@ package :rpm do
   end
 end
 
+package :msi do
+  skip_packager true
+end
+
 package :xz do
   skip_packager generate_distro_package
   compression_threads COMPRESSION_THREADS
@@ -137,39 +147,40 @@ end
 # Dependencies
 # ------------------------------------
 
-if linux_target?
-  systemd_directory = "/usr/lib/systemd/system"
-  if debian_target?
-    systemd_directory = "/lib/systemd/system"
-  end
-  extra_package_file "#{systemd_directory}/datadog-installer.service"
-  extra_package_file '/etc/datadog-agent/'
-  extra_package_file '/var/log/datadog/'
-  extra_package_file '/var/run/datadog-packages/'
-  extra_package_file '/opt/datadog-packages/'
-end
-
 # Include all package scripts for the intermediary XZ package, or only those
 # for the package being created
 if linux_target?
   if !generate_distro_package
-    extra_package_file "#{Omnibus::Config.project_root}/package-scripts/updater-deb"
-    extra_package_file "#{Omnibus::Config.project_root}/package-scripts/updater-rpm"
+    extra_package_file "#{Omnibus::Config.project_root}/package-scripts/installer-deb"
+    extra_package_file "#{Omnibus::Config.project_root}/package-scripts/installer-rpm"
+    extra_package_file "#{Omnibus::Config.project_root}/config/templates/installer/README.md.erb"
   end
   if debian_target?
-      package_scripts_path "#{Omnibus::Config.project_root}/package-scripts/updater-deb"
-  elsif redhat_target?
-      package_scripts_path "#{Omnibus::Config.project_root}/package-scripts/updater-rpm"
+      package_scripts_path "#{Omnibus::Config.project_root}/package-scripts/installer-deb"
+  elsif redhat_target? || suse_target?
+      package_scripts_path "#{Omnibus::Config.project_root}/package-scripts/installer-rpm"
   end
 end
 
 exclude '\.git*'
 exclude 'bundler\/git'
 
-if linux_target?
+if windows_target?
+  BINARIES = [
+    "#{install_dir}\\datadog-installer.exe"
+  ]
+  BINARIES.each do |bin|
+    windows_symbol_stripping_file bin
+    if ENV['SIGN_WINDOWS_DD_WCS']
+      sign_file bin
+    end
+  end
+end
+
+if linux_target? or windows_target?
   # the stripper will drop the symbols in a `.debug` folder in the installdir
   # we want to make sure that directory is not in the main build, while present
   # in the debug package.
-  strip_build true
+  strip_build !generate_distro_package
   debug_path ".debug"  # the strip symbols will be in here
 end

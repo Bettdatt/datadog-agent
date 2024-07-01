@@ -20,7 +20,7 @@ import (
 
 	manager "github.com/DataDog/ebpf-manager"
 
-	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/ebpf/probe/ebpfcheck"
+	ddebpf "github.com/DataDog/datadog-agent/pkg/ebpf"
 	"github.com/DataDog/datadog-agent/pkg/ebpf/maps"
 	"github.com/DataDog/datadog-agent/pkg/network/config"
 	"github.com/DataDog/datadog-agent/pkg/network/ebpf/probes"
@@ -74,7 +74,7 @@ func (c *conntrackOffsetGuesser) Manager() *manager.Manager {
 }
 
 func (c *conntrackOffsetGuesser) Close() {
-	ebpfcheck.RemoveNameMappings(c.m)
+	ddebpf.RemoveNameMappings(c.m)
 	if err := c.m.Stop(manager.CleanAll); err != nil {
 		log.Warnf("error stopping conntrack offset guesser: %s", err)
 	}
@@ -166,9 +166,9 @@ func (c *conntrackOffsetGuesser) checkAndUpdateCurrentOffset(mp *maps.GenericMap
 			log.Debugf("Successfully guessed %v with offset of %d bytes", "ino", c.status.Offset_ino)
 			return c.setReadyState(mp)
 		}
+		log.Tracef("%v %d does not match expected %d, incrementing offset netns: %d, ino: %d",
+			whatString[GuessWhat(c.status.What)], c.status.Netns, expected.netns, c.status.Offset_netns, c.status.Offset_ino)
 		c.status.Offset_ino++
-		log.Tracef("%v %d does not match expected %d, incrementing offset %d",
-			whatString[GuessWhat(c.status.What)], c.status.Netns, expected.netns, c.status.Offset_netns)
 		if c.status.Err != 0 || c.status.Offset_ino >= threshold {
 			c.status.Offset_ino = 0
 			c.status.Offset_netns++

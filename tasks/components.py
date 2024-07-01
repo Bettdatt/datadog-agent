@@ -1,9 +1,11 @@
 """
 Invoke entrypoint, import here all the tasks we want to make available
 """
+
 import os
 import pathlib
 from collections import namedtuple
+from collections.abc import Iterable
 from string import Template
 
 from invoke import task
@@ -15,18 +17,18 @@ Component = namedtuple('Component', ['path', 'doc', 'team'])
 Bundle = namedtuple('Bundle', ['path', 'doc', 'team', 'components'])
 
 
-def find_team(content):
-    for l in content:
-        if l.startswith('// team: '):
-            return l.split(':', 2)[1].strip()
+def find_team(content: Iterable[str]) -> str:
+    for line in content:
+        if line.startswith('// team: '):
+            return line.split(':', 2)[1].strip()
 
 
-def find_doc(content):
+def find_doc(content) -> str:
     comment_block = []
-    for l in content:
-        if l.startswith('//'):
-            comment_block.append(l[3:])
-        elif l.startswith('package '):
+    for line in content:
+        if line.startswith('//'):
+            comment_block.append(line[3:])
+        elif line.startswith('package '):
             try:
                 i = comment_block.index('')
                 comment_block = comment_block[:i]
@@ -37,8 +39,8 @@ def find_doc(content):
             comment_block = []
 
 
-def has_type_component(content):
-    return any(l.startswith('type Component interface') for l in content)
+def has_type_component(content) -> bool:
+    return any(line.startswith('type Component interface') for line in content)
 
 
 # // TODO: (components)
@@ -48,15 +50,12 @@ components_to_migrate = [
     "comp/aggregator/demultiplexer/component.go",
     "comp/core/config/component.go",
     "comp/core/flare/component.go",
-    "comp/core/telemetry/component.go",
     "comp/dogstatsd/replay/component.go",
     "comp/dogstatsd/server/component.go",
     "comp/forwarder/defaultforwarder/component.go",
-    "comp/logs/agent/component.go",
     "comp/metadata/inventoryagent/component.go",
     "comp/netflow/config/component.go",
     "comp/netflow/server/component.go",
-    "comp/otelcol/collector/component.go",
     "comp/remote-config/rcclient/component.go",
     "comp/trace/agent/component.go",
     "comp/trace/config/component.go",
@@ -81,15 +80,19 @@ implementation_definitions = [
 ]
 
 
-def check_component_contents_and_file_hiearchy(file, content, directory):
-    if not any(l.startswith('type Component interface') or l.startswith('type Component = ') for l in content):
+def check_component_contents_and_file_hiearchy(entry_point):
+    content = entry_point.content
+    file = entry_point.file
+    directory = entry_point.dir
+
+    if not any(line.startswith('type Component interface') or line.startswith('type Component = ') for line in content):
         return f"** {file} does not define a Component interface; skipping"
 
     if str(file) in components_to_migrate:
         return ""
 
     for implemenation_definition in implementation_definitions:
-        if any(l.startswith(implemenation_definition) for l in content):
+        if any(line.startswith(implemenation_definition) for line in content):
             return f"** {file} define '{implemenation_definition}' which is not allow in {file}. See docs/components/defining-components.md; skipping"
 
     component_name = directory.stem
@@ -99,7 +102,8 @@ def check_component_contents_and_file_hiearchy(file, content, directory):
         return ""
 
     for folder in directory.iterdir():
-        if folder.match('*impl'):
+        # Allow implementation to be old style <component>impl or new style <component>/impl or <component>/impl-<suffix>
+        if folder.match('*impl') or folder.match('impl-*'):
             missing_implementation_folder = False
             # TODO: check that the implementation_definitions are present in any of the files of the impl folder
             break
@@ -121,44 +125,43 @@ def get_components_and_bundles():
         component_directory = pathlib.Path(component_file)
         for component_entry in component_directory.iterdir():
             # If we encounter a file at the first level it could be a bundle
-            if component_entry.is_file():
-                if component_entry.name == "bundle.go":
-                    content = list(component_entry.open())
-                    if has_type_component(content):
-                        print(f"** {component_entry} defines a Component interface (bundles should not do so)")
-                        ok = False
-                        pass
+            if component_entry.is_file() and component_entry.name == "bundle.go":
+                content = list(component_entry.open())
+                if has_type_component(content):
+                    print(f"** {component_entry} defines a Component interface (bundles should not do so)")
+                    ok = False
+                    pass
 
-                    path = str(component_entry)[: -len('/bundle.go')]
-                    team = find_team(content)
-                    doc = find_doc(content)
+                path = str(component_entry)[: -len('/bundle.go')]
+                team = find_team(content)
+                doc = find_doc(content)
 
-                    if team is None:
-                        print(f"** {component_entry} does not specify a team owner")
-                        ok = False
+                if team is None:
+                    print(f"** {component_entry} does not specify a team owner")
+                    ok = False
 
-                    bundles.append(Bundle(path, doc, team, []))
-            else:
-                for component_file in component_entry.iterdir():
-                    if component_file.name == "component.go":
-                        # We are a component
-                        # Let's check the file content and hierarchy
-                        content = list(component_file.open())
-                        error = check_component_contents_and_file_hiearchy(component_file, content, component_entry)
-                        if error != "":
-                            print(error)
-                            ok = False
-                            pass
+                bundles.append(Bundle(path, doc, team, []))
+                continue
 
-                        path = str(component_file)[: -len('/component.go')]
-                        team = find_team(content)
-                        doc = find_doc(content)
+            component_root = locate_root(component_entry)
+            if component_root is not None:
+                # Found a component's root
+                # Let's check the file content and hierarchy
+                error = check_component_contents_and_file_hiearchy(component_root)
+                if error != "":
+                    print(error)
+                    ok = False
+                    pass
 
-                        if team is None:
-                            print(f"** {path} does not specify a team owner")
-                            ok = False
+                path = str(component_root.dir)
+                team = find_team(component_root.content)
+                doc = find_doc(component_root.content)
 
-                        components.append(Component(path, doc, team))
+                if team is None:
+                    print(f"** {path} does not specify a team owner")
+                    ok = False
+
+                components.append(Component(path, doc, team))
 
     # assign components to bundles
     sorted_bundles = []
@@ -177,6 +180,29 @@ def get_components_and_bundles():
             components_without_bundle.append(c)
 
     return sorted(sorted_bundles), sorted(components_without_bundle), ok
+
+
+class ComponentRoot:
+    def __init__(self, file, dir, version):
+        self.file = file
+        self.dir = dir
+        self.version = version
+        self.content = list(self.file.open())
+
+
+def locate_root(dir):
+    """
+    Locate the root of the component, if this directory contains a component
+    """
+    # v2 component: this folder is a component root if it contains 'def/component.go'
+    component_file = dir / 'def/component.go'
+    if component_file.is_file():
+        return ComponentRoot(component_file, dir, 2)
+    # v1 component: this folder is a component root if it contains '/component.go' but the path is not '/def/component.go'
+    #    in particular, the directory named 'def' should not be treated as a component root
+    component_file = dir / 'component.go'
+    if component_file.is_file() and '/def/component.go' not in str(component_file):
+        return ComponentRoot(component_file, dir, 1)
 
 
 def make_components_md(bundles, components_without_bundle):
@@ -209,6 +235,11 @@ def make_components_md(bundles, components_without_bundle):
         yield c.doc
 
 
+def build_codeowner_entry(path, team):
+    teams = [f'@DataDog/{team}' for team in team.split(' ')]
+    return f'/{path} ' + ' '.join(teams)
+
+
 def make_codeowners(codeowners_lines, bundles, components_without_bundle):
     codeowners_lines = codeowners_lines.__iter__()
 
@@ -225,15 +256,15 @@ def make_codeowners(codeowners_lines, bundles, components_without_bundle):
     different_components = []
     for b in bundles:
         if b.team:
-            yield f'/{b.path} @DataDog/{b.team}'
+            yield build_codeowner_entry(b.path, b.team)
         for c in b.components:
             if c.team != b.team:
                 different_components.append(c)
     for c in different_components:
         if c.team:
-            yield f'/{c.path} @DataDog/{c.team}'
+            yield build_codeowner_entry(c.path, c.team)
     for c in components_without_bundle:
-        yield f'/{c.path} @DataDog/{c.team}'
+        yield build_codeowner_entry(c.path, c.team)
 
     # drop lines from the existing codeowners until "# END COMPONENTS"
     for line in codeowners_lines:
@@ -264,7 +295,7 @@ def lint_components(_, fix=False):
         with open(filename, "w") as f:
             f.write(components_md)
     else:
-        with open(filename, "r") as f:
+        with open(filename) as f:
             current = f.read()
             if current != components_md:
                 print(f"** {filename} differs")
@@ -273,7 +304,7 @@ def lint_components(_, fix=False):
 
     # Check .github/CODEOWNERS
     filename = ".github/CODEOWNERS"
-    with open(filename, "r") as f:
+    with open(filename) as f:
         current = f.read()
     codeowners = '\n'.join(make_codeowners(current.splitlines(), bundles, components_without_bundle))
     if fix:
@@ -336,10 +367,10 @@ def new_component(_, comp_path, overwrite=False, team="/* TODO: add team name */
     create_components_framework_files(
         comp_path,
         [
-            ("component.go", "component.go"),
-            ("component_mock.go", "component_mock.go"),
-            (os.path.join(f"{component_name}impl", f"{component_name}.go"), "impl/component.go"),
-            (os.path.join(f"{component_name}impl", f"{component_name}_mock.go"), "impl/component_mock.go"),
+            ("def/component.go", "def/component.go"),
+            ("fx/fx.go", "fx/fx.go"),
+            (os.path.join("impl", f"{component_name}.go"), "impl/component.go"),
+            ("mock/mock.go", "mock/mock.go"),
         ],
         template_var_mapping,
         overwrite,
@@ -419,7 +450,7 @@ def read_file_content(template_path):
     """
     Read all lines in files and return them as a single string.
     """
-    with open(template_path, "r") as file:
+    with open(template_path) as file:
         return file.read()
 
 
@@ -435,10 +466,6 @@ def lint_fxutil_oneshot_test(_):
         for file in folder_path.rglob("*.go"):
             # Don't lint test files
             if str(file).endswith("_test.go"):
-                continue
-
-            excluded_cmds = ["agentless-scanner"]
-            if file.parts[0] == "cmd" and file.parts[1] in excluded_cmds:
                 continue
 
             one_shot_count = file.read_text().count("fxutil.OneShot(")
