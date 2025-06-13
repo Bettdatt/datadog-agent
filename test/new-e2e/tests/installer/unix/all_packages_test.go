@@ -50,7 +50,6 @@ var (
 		e2eos.Suse15,
 	}
 	packagesTestsWithSkippedFlavors = []packageTestsWithSkippedFlavors{
-		{t: testInstaller},
 		{t: testAgent},
 		{t: testApmInjectAgent, skippedFlavors: []e2eos.Descriptor{e2eos.CentOS7, e2eos.RedHat9, e2eos.FedoraDefault, e2eos.AmazonLinux2}, skippedInstallationMethods: []InstallMethodOption{InstallMethodAnsible}},
 		{t: testUpgradeScenario, skippedInstallationMethods: []InstallMethodOption{InstallMethodAnsible}},
@@ -300,7 +299,7 @@ func (s *packageBaseSuite) Purge() {
 	s.Env().RemoteHost.Execute("sudo datadog-installer purge")
 	s.Env().RemoteHost.Execute("sudo /opt/datadog-packages/datadog-installer/stable/bin/installer/installer purge")
 	s.Env().RemoteHost.Execute("sudo /opt/datadog-packages/datadog-agent/stable/embedded/bin/installer purge")
-	s.Env().RemoteHost.Execute("sudo apt-get remove -y --purge datadog-installer || sudo yum remove -y datadog-installer || sudo zypper remove -y datadog-installer")
+	s.Env().RemoteHost.Execute("sudo apt-get remove -y --purge datadog-installer datadog-agent|| sudo yum remove -y datadog-installer datadog-agent || sudo zypper remove -y datadog-installer datadog-agent")
 	s.Env().RemoteHost.Execute("sudo rm -rf /etc/datadog-agent")
 }
 
@@ -411,6 +410,12 @@ func (s *packageBaseSuite) writeAnsiblePlaybook(env map[string]string, params ..
 		case "TESTING_APT_REPO_VERSION", "TESTING_APT_URL", "TESTING_APT_KEY", "TESTING_YUM_URL", "TESTING_YUM_VERSION_PATH":
 			defaultRepoEnv[key] = value
 			environments = append(environments, fmt.Sprintf("%s: %s", key, value))
+		case "DD_INSTALLER_DEFAULT_PKG_VERSION_DATADOG_INSTALLER":
+			playbookStringSuffix += fmt.Sprintf("    datadog_installer_version: %s\n", value)
+			environments = append(environments, fmt.Sprintf("%s: \"%s\"", key, value))
+		case "DD_INSTALLER_DEFAULT_PKG_VERSION_DATADOG_APM_INJECT":
+			playbookStringSuffix += fmt.Sprintf("    datadog_apm_inject_version: %s\n", value)
+			environments = append(environments, fmt.Sprintf("%s: \"%s\"", key, value))
 		default:
 			environments = append(environments, fmt.Sprintf("%s: \"%s\"", key, value))
 		}
