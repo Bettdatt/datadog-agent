@@ -32,7 +32,18 @@ import (
 type Rule struct {
 	*PolicyRule
 	*eval.Rule
-	NoDiscarder bool
+}
+
+// DiscarderInvalidReport is a report of an invalid discarder
+type DiscarderInvalidReport struct {
+	RuleID eval.RuleID `json:"rule_id"`
+	Field  eval.Field  `json:"field"`
+}
+
+// DiscardersReport is a report of the discarders in the ruleset
+type DiscardersReport struct {
+	Supported []eval.Field             `json:"supported"`
+	Invalid   []DiscarderInvalidReport `json:"invalid"`
 }
 
 // RuleSetListener describes the methods implemented by an object used to be
@@ -79,6 +90,11 @@ func (rs *RuleSet) ListRuleIDs() []RuleID {
 // GetRules returns the active rules
 func (rs *RuleSet) GetRules() map[eval.RuleID]*Rule {
 	return rs.rules
+}
+
+// GetRuleBucket returns the rule bucket for the given event type
+func (rs *RuleSet) GetRuleBucket(eventType eval.EventType) *RuleBucket {
+	return rs.eventRuleBuckets[eventType]
 }
 
 // GetOnDemandHookPoints gets the on-demand hook points
@@ -274,6 +290,42 @@ func (rs *RuleSet) AddRules(parsingContext *ast.ParsingContext, pRules []*Policy
 	return result
 }
 
+// GetDiscardersReport returns a discarders state report
+func (rs *RuleSet) GetDiscardersReport() (*DiscardersReport, error) {
+	var report DiscardersReport
+
+	event := rs.NewFakeEvent()
+	ctx := eval.NewContext(event)
+
+	errFieldNotFound := &eval.ErrFieldNotFound{}
+
+	for field := range rs.opts.SupportedDiscarders {
+		eventType, _, _, err := event.GetFieldMetadata(field)
+		if err != nil {
+			return nil, err
+		}
+
+		bucket := rs.GetRuleBucket(eventType)
+		if bucket == nil {
+			continue
+		}
+
+		_, rule, err := rs.IsDiscarder(ctx, field, bucket.GetRules())
+		if err != nil {
+			if errors.As(err, &errFieldNotFound) {
+				report.Invalid = append(report.Invalid, DiscarderInvalidReport{
+					RuleID: rule.ID,
+					Field:  field,
+				})
+			}
+		} else {
+			report.Supported = append(report.Supported, field)
+		}
+	}
+
+	return &report, nil
+}
+
 // PopulateFieldsWithRuleActionsData populates the fields with the data from the rule actions
 func (rs *RuleSet) PopulateFieldsWithRuleActionsData(policyRules []*PolicyRule, opts PolicyLoaderOpts) *multierror.Error {
 	var errs *multierror.Error
@@ -397,7 +449,7 @@ func (rs *RuleSet) PopulateFieldsWithRuleActionsData(policyRules []*PolicyRule, 
 					variableProvider = rs.globalVariables
 				}
 
-				opts := eval.VariableOpts{TTL: actionDef.Set.TTL.GetDuration(), Size: actionDef.Set.Size}
+				opts := eval.VariableOpts{TTL: actionDef.Set.TTL.GetDuration(), Size: actionDef.Set.Size, Private: actionDef.Set.Private, Inherited: actionDef.Set.Inherited}
 
 				variable, err := variableProvider.NewSECLVariable(actionDef.Set.Name, variableValue, opts)
 				if err != nil {
@@ -406,7 +458,12 @@ func (rs *RuleSet) PopulateFieldsWithRuleActionsData(policyRules []*PolicyRule, 
 				}
 
 				if existingVariable := rs.evalOpts.VariableStore.Get(varName); existingVariable != nil && reflect.TypeOf(variable) != reflect.TypeOf(existingVariable) {
-					errs = multierror.Append(errs, fmt.Errorf("conflicting types for variable '%s'", varName))
+					errs = multierror.Append(errs, fmt.Errorf("conflicting types for variable '%s': %s != %s", varName, reflect.TypeOf(variable), reflect.TypeOf(existingVariable)))
+					continue
+				}
+
+				if existingVariable := rs.evalOpts.VariableStore.Get(varName); existingVariable != nil && existingVariable.GetVariableOpts().Private != variable.GetVariableOpts().Private {
+					errs = multierror.Append(errs, fmt.Errorf("conflicting private flag for variable '%s'", varName))
 					continue
 				}
 
@@ -438,6 +495,11 @@ func GetRuleEventType(rule *eval.Rule) (eval.EventType, error) {
 	}
 
 	return eventType, nil
+}
+
+// WithExcludedRuleFromDiscarders set excluded rule from discarders
+func (rs *RuleSet) WithExcludedRuleFromDiscarders(excludedRuleFromDiscarders map[eval.RuleID]bool) {
+	rs.opts.ExcludedRuleFromDiscarders = excludedRuleFromDiscarders
 }
 
 func (rs *RuleSet) isActionAvailable(eventType eval.EventType, action *Action) bool {
@@ -532,6 +594,13 @@ func (rs *RuleSet) innerAddExpandedRule(parsingContext *ast.ParsingContext, pRul
 		}
 
 		if action.Def.Set != nil {
+			// compile scope field
+			if len(action.Def.Set.ScopeField) > 0 {
+				if err := action.CompileScopeField(rs.model); err != nil {
+					return "", &ErrRuleLoad{Rule: pRule, Err: err}
+				}
+			}
+
 			if field := action.Def.Set.Field; field != "" {
 				if _, found := rs.fieldEvaluators[field]; !found {
 					evaluator, err := rs.model.GetEvaluator(field, "", 0)
@@ -621,9 +690,12 @@ func (rs *RuleSet) GetBucket(eventType eval.EventType) *RuleBucket {
 }
 
 // GetApprovers returns all approvers
-func (rs *RuleSet) GetApprovers(fieldCaps map[eval.EventType]FieldCapabilities) (map[eval.EventType]Approvers, map[eval.EventType]*Rule, error) {
-	approvers := make(map[eval.EventType]Approvers)
-	rules := make(map[eval.EventType]*Rule)
+func (rs *RuleSet) GetApprovers(fieldCaps map[eval.EventType]FieldCapabilities) (map[eval.EventType]Approvers, map[eval.EventType]*Rule, []*Rule, error) {
+	var (
+		approvers        = make(map[eval.EventType]Approvers)
+		acceptModeRules  = make(map[eval.EventType]*Rule)
+		noDiscarderRules []*Rule
+	)
 
 	for _, eventType := range rs.GetEventTypes() {
 		caps, exists := fieldCaps[eventType]
@@ -631,27 +703,28 @@ func (rs *RuleSet) GetApprovers(fieldCaps map[eval.EventType]FieldCapabilities) 
 			continue
 		}
 
-		eventTypeApprovers, rule, err := rs.GetEventTypeApprovers(eventType, caps)
-		if err != nil || len(eventTypeApprovers) == 0 {
+		evtApprovers, rule, evtNoDiscarderRules, err := rs.GetEventTypeApprovers(eventType, caps)
+		if err != nil || len(evtApprovers) == 0 {
 			// report the first rule avoiding to generate an approver
-			rules[eventType] = rule
+			acceptModeRules[eventType] = rule
 			continue
 		}
-		approvers[eventType] = eventTypeApprovers
+		approvers[eventType] = evtApprovers
+		noDiscarderRules = append(noDiscarderRules, evtNoDiscarderRules...)
 	}
 
-	return approvers, rules, nil
+	return approvers, acceptModeRules, noDiscarderRules, nil
 }
 
 // GetEventTypeApprovers returns approvers for the given event type and the fields
-func (rs *RuleSet) GetEventTypeApprovers(eventType eval.EventType, fieldCaps FieldCapabilities) (Approvers, *Rule, error) {
+func (rs *RuleSet) GetEventTypeApprovers(eventType eval.EventType, fieldCaps FieldCapabilities) (Approvers, *Rule, []*Rule, error) {
 	bucket, exists := rs.eventRuleBuckets[eventType]
 	if !exists {
-		return nil, nil, ErrNoEventTypeBucket{EventType: eventType}
+		return nil, nil, nil, ErrNoEventTypeBucket{EventType: eventType}
 	}
 
 	// all the rules needs to be of the same type
-	return getApprovers(bucket.rules, rs.newFakeEvent(), fieldCaps)
+	return getApprovers(bucket.rules, rs.NewFakeEvent(), fieldCaps)
 }
 
 // GetFieldValues returns all the values of the given field
@@ -669,45 +742,30 @@ func (rs *RuleSet) GetFieldValues(field eval.Field) []eval.FieldValue {
 }
 
 // IsDiscarder partially evaluates an Event against a field
-func IsDiscarder(ctx *eval.Context, field eval.Field, rules []*Rule) (bool, error) {
+func (rs *RuleSet) IsDiscarder(ctx *eval.Context, field eval.Field, rules []*Rule) (bool, *Rule, error) {
 	var isDiscarder bool
 
 	for _, rule := range rules {
 		// ignore rule that can't generate discarders
-		if rule.NoDiscarder {
+		if _, exists := rs.opts.ExcludedRuleFromDiscarders[rule.ID]; exists {
 			continue
 		}
 
 		isTrue, err := rule.PartialEval(ctx, field)
 		if err != nil || isTrue {
-			return false, err
+			return false, rule, err
 		}
 
 		isDiscarder = true
 	}
-	return isDiscarder, nil
-}
-
-// IsDiscarder partially evaluates an Event against a field
-func (rs *RuleSet) IsDiscarder(event eval.Event, field eval.Field) (bool, error) {
-	eventType, _, _, err := event.GetFieldMetadata(field)
-	if err != nil {
-		return false, err
-	}
-
-	bucket, exists := rs.eventRuleBuckets[eventType]
-	if !exists {
-		return false, &ErrNoEventTypeBucket{EventType: eventType}
-	}
-
-	ctx := rs.pool.Get(event)
-	defer rs.pool.Put(ctx)
-
-	return IsDiscarder(ctx, field, bucket.rules)
+	return isDiscarder, nil, nil
 }
 
 func (rs *RuleSet) runSetActions(_ eval.Event, ctx *eval.Context, rule *Rule) error {
 	for _, action := range rule.PolicyRule.Actions {
+		// set context scope field evaluator
+		ctx.SetScopeFieldEvaluator(action.ScopeFieldEvaluator)
+
 		if !action.IsAccepted(ctx) {
 			continue
 		}
@@ -737,7 +795,6 @@ func (rs *RuleSet) runSetActions(_ eval.Event, ctx *eval.Context, rule *Rule) er
 						value = evaluator.Eval(ctx)
 					}
 				}
-
 				if action.Def.Set.Append {
 					if err := mutable.Append(ctx, value); err != nil {
 						return fmt.Errorf("append is not supported for %s", reflect.TypeOf(value))
@@ -754,6 +811,8 @@ func (rs *RuleSet) runSetActions(_ eval.Event, ctx *eval.Context, rule *Rule) er
 			}
 
 		}
+
+		ctx.PerActionReset()
 	}
 
 	return nil
@@ -877,13 +936,11 @@ func (rs *RuleSet) EvaluateDiscarders(event eval.Event) {
 			}
 		}
 
-		if rs.opts.SupportedDiscarders != nil {
-			if _, exists := rs.opts.SupportedDiscarders[field]; !exists {
-				continue
-			}
+		if _, exists := rs.opts.SupportedDiscarders[field]; !exists {
+			continue
 		}
 
-		if isDiscarder, _ := IsDiscarder(ctx, field, bucket.rules); isDiscarder {
+		if isDiscarder, _, _ := rs.IsDiscarder(ctx, field, bucket.rules); isDiscarder {
 			rs.NotifyDiscarderFound(event, field, eventType)
 		}
 	}
@@ -903,7 +960,7 @@ func (rs *RuleSet) EvaluateDiscarders(event eval.Event) {
 				break
 			}
 
-			if isDiscarder, _ := IsDiscarder(dctx, entry.Field, bucket.rules); !isDiscarder {
+			if isDiscarder, _, _ := rs.IsDiscarder(dctx, entry.Field, bucket.rules); !isDiscarder {
 				isMultiDiscarder = false
 				break
 			}
@@ -989,6 +1046,11 @@ func (rs *RuleSet) LoadPolicies(loader *PolicyLoader, opts PolicyLoaderOpts) *mu
 	rs.policies = policies
 
 	for _, policy := range policies {
+		if len(policy.macros) == 0 && len(policy.rules) == 0 {
+			errs = multierror.Append(errs, &ErrPolicyLoad{Name: policy.Info.Name, Version: policy.Info.Version, Source: policy.Info.Source, Err: ErrPolicyIsEmpty})
+			continue
+		}
+
 		for _, macro := range policy.GetAcceptedMacros() {
 			if existingMacro := macroIndex[macro.Def.ID]; existingMacro != nil {
 				if err := existingMacro.MergeWith(macro); err != nil {
@@ -1003,9 +1065,7 @@ func (rs *RuleSet) LoadPolicies(loader *PolicyLoader, opts PolicyLoaderOpts) *mu
 		for _, rule := range policy.GetAcceptedRules() {
 			if existingRule := rulesIndex[rule.Def.ID]; existingRule != nil {
 				existingRule.UsedBy = append(existingRule.UsedBy, rule.Policy)
-				if err := existingRule.MergeWith(rule); err != nil {
-					errs = multierror.Append(errs, err)
-				}
+				existingRule.MergeWith(rule)
 			} else {
 				rule.UsedBy = append(rule.UsedBy, rule.Policy)
 				rulesIndex[rule.Def.ID] = rule
@@ -1039,8 +1099,8 @@ func (rs *RuleSet) SetFakeEventCtor(fakeEventCtor func() eval.Event) {
 	rs.fakeEventCtor = fakeEventCtor
 }
 
-// newFakeEvent returns a new event using the embedded constructor for fake events
-func (rs *RuleSet) newFakeEvent() eval.Event {
+// NewFakeEvent returns a new event using the embedded constructor for fake events
+func (rs *RuleSet) NewFakeEvent() eval.Event {
 	if rs.fakeEventCtor != nil {
 		return rs.fakeEventCtor()
 	}
