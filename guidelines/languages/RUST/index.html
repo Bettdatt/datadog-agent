@@ -4498,7 +4498,7 @@
 </span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="n">rust</span> <span class="o">=</span> <span class="n">use_extension</span><span class="p">(</span><span class="s2">"@rules_rust//rust:extensions.bzl"</span><span class="p">,</span> <span class="s2">"rust"</span><span class="p">)</span>
 </span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="n">rust</span><span class="o">.</span><span class="n">toolchain</span><span class="p">(</span>
 </span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>    <span class="n">edition</span> <span class="o">=</span> <span class="s2">"2024"</span><span class="p">,</span>
-</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>    <span class="n">versions</span> <span class="o">=</span> <span class="p">[</span><span class="s2">"1.92.0"</span><span class="p">],</span>
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>    <span class="n">versions</span> <span class="o">=</span> <span class="p">[</span><span class="s2">"1.94.0"</span><span class="p">],</span>
 </span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="p">)</span>
 </span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="n">use_repo</span><span class="p">(</span><span class="n">rust</span><span class="p">,</span> <span class="s2">"rust_toolchains"</span><span class="p">)</span>
 </span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>
@@ -4506,7 +4506,7 @@
 </span></code></pre></div>
 <p>This configuration:
 - Uses <strong>Rust 2024 edition</strong> as the default
-- Pins to <strong>Rust 1.92.0</strong> for reproducible builds
+- Pins to <strong>Rust 1.94.0</strong> for reproducible builds
 - Registers toolchains for all supported platforms</p>
 <blockquote>
 <p><strong>Important:</strong> This is a global toolchain configuration that is used across the entire codebase of <code>datadog-agent</code>. The configuration in <a href="https://github.com/DataDog/datadog-agent/blob/main/MODULE.bazel"><code>MODULE.bazel</code></a> <strong>should not be changed</strong> without proper testing to ensure
